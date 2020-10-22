@@ -41,12 +41,18 @@ func main() {
 
 	logger := promlog.New(promlogConfig)
 
-	p, err := newProxy(context.Background(), logger, proxyCfg{
+	ctx := context.Background()
+	p, err := newProxy(ctx, logger, proxyCfg{
 		penalty:       *penalty,
 		failoverAfter: *failoverAfter,
 		clusterAddr:   *clusterAddr,
 		peers:         *peers,
 	})
+	if err != nil {
+		panic(err)
+	}
+
+	err = p.Join(ctx)
 	if err != nil {
 		panic(err)
 	}

@@ -25,6 +25,8 @@ import (
 )
 
 type proxy struct {
+	cfg proxyCfg
+
 	logger log.Logger
 	client *http.Client
 
@@ -48,7 +50,12 @@ type proxyCfg struct {
 }
 
 func newProxy(ctx context.Context, logger log.Logger, cfg proxyCfg) (*proxy, error) {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+
 	p := &proxy{
+		cfg:           cfg,
 		logger:        logger,
 		client:        &http.Client{},
 		penalty:       cfg.penalty.Milliseconds(),
@@ -80,21 +87,36 @@ func newProxy(ctx context.Context, logger log.Logger, cfg proxyCfg) (*proxy, err
 	}
 	p.memberlist = list
 
-	members, err := p.resolveMembers(ctx, cfg.peers)
-	if err != nil {
-		return nil, errors.Wrap(err, "resolving members")
-	}
-	_, err = list.Join(members)
-	if err != nil {
-		return nil, err
-	}
-
 	p.broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: list.NumMembers,
 	}
 
 	go p.loop(ctx)
 	return p, nil
+}
+
+// Join joins the gossip group. It will retry upon failure or if not enough
+// peers were found.
+func (p *proxy) Join(ctx context.Context) error {
+	members, err := p.resolveMembers(ctx, p.cfg.peers)
+	if err != nil {
+		return errors.Wrap(err, "resolving members")
+	}
+	backoff := 250 * time.Millisecond
+	for i := 0; i < 5; i++ {
+		var n int
+		n, err = p.memberlist.Join(members)
+		if err != nil {
+			continue
+		}
+		if n >= len(members) {
+			break
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+
+	return err
 }
 
 func (p *proxy) loop(ctx context.Context) {
@@ -306,6 +328,7 @@ func (p *proxy) resolveMembers(ctx context.Context, members []string) ([]string,
 	var otherMembers []string
 
 	me := p.memberlist.LocalNode().Addr
+	myPort := p.memberlist.LocalNode().Port
 
 	for _, peer := range members {
 		host, port, err := net.SplitHostPort(peer)
@@ -315,7 +338,7 @@ func (p *proxy) resolveMembers(ctx context.Context, members []string) ([]string,
 
 		// See if the member is a raw IP address and add it.
 		if ip := net.ParseIP(host); ip != nil {
-			if me.Equal(ip) {
+			if me.Equal(ip) && port == fmt.Sprintf("%d", myPort) {
 				continue
 			}
 			otherMembers = append(otherMembers, net.JoinHostPort(ip.String(), port))
