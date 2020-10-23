@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -42,7 +44,7 @@ func main() {
 	logger := promlog.New(promlogConfig)
 
 	ctx := context.Background()
-	p, err := newProxy(ctx, logger, proxyCfg{
+	p, err := newProxy(ctx, logger, prometheus.DefaultRegisterer, proxyCfg{
 		penalty:       *penalty,
 		failoverAfter: *failoverAfter,
 		clusterAddr:   *clusterAddr,
@@ -73,5 +75,8 @@ func main() {
 			)
 		}
 	}()
-	http.ListenAndServe(*listenAddr, p)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/", p)
+	http.ListenAndServe(*listenAddr, mux)
 }

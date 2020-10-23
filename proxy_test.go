@@ -25,7 +25,7 @@ func TestProxy(t *testing.T) {
 
 	addr1 := "127.0.0.1:34000"
 	addr2 := "127.0.0.1:34001"
-	p1, err := newProxy(ctx, nil, proxyCfg{
+	p1, err := newProxy(ctx, nil, nil, proxyCfg{
 		clusterAddr:   addr1,
 		peers:         []string{addr1, addr2},
 		penalty:       1 * time.Second,
@@ -33,7 +33,7 @@ func TestProxy(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	p2, err := newProxy(ctx, nil, proxyCfg{
+	p2, err := newProxy(ctx, nil, nil, proxyCfg{
 		clusterAddr:   addr2,
 		peers:         []string{addr1, addr2},
 		penalty:       1 * time.Second,

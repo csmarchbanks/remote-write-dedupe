@@ -21,7 +21,26 @@ import (
 	"github.com/golang/snappy"
 	"github.com/hashicorp/memberlist"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/prompb"
+)
+
+const namespace = "rwdedupe"
+
+var (
+	requests = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "proxy",
+		Name:      "request_duration_seconds",
+		Help:      "How long proxy requests take to complete by URL.",
+	}, []string{"url"})
+	failures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "proxy",
+		Name:      "request_failures_total",
+		Help:      "The count of proxy failures, this does not include error codes from upstream.",
+	}, []string{"url"})
 )
 
 type proxy struct {
@@ -49,7 +68,7 @@ type proxyCfg struct {
 	failoverAfter time.Duration
 }
 
-func newProxy(ctx context.Context, logger log.Logger, cfg proxyCfg) (*proxy, error) {
+func newProxy(ctx context.Context, logger log.Logger, reg prometheus.Registerer, cfg proxyCfg) (*proxy, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -90,6 +109,18 @@ func newProxy(ctx context.Context, logger log.Logger, cfg proxyCfg) (*proxy, err
 	p.broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: list.NumMembers,
 	}
+
+	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "proxy",
+		Name:      "active",
+		Help:      "Whether this instance is considered to be the active replica.",
+	}, func() float64 {
+		if p.IsActive() {
+			return 1.0
+		}
+		return 0.0
+	})
 
 	go p.loop(ctx)
 	return p, nil
@@ -249,24 +280,40 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy not ready", http.StatusServiceUnavailable)
 		return
 	}
-	start := time.Now()
 
+	if r.URL.Path == "/ready" {
+		return
+	}
+
+	err := p.handleWriteRequest(w, r)
+	if err != nil {
+		level.Warn(p.logger).Log("msg", "error proxying to upstream", "url", r.URL.String(), "err", err)
+		failures.WithLabelValues(r.URL.String()).Inc()
+	}
+
+}
+
+func (p *proxy) handleWriteRequest(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	defer func() {
+		requests.WithLabelValues(r.URL.String()).Observe(time.Since(start).Seconds())
+	}()
 	compressed, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return errors.Wrap(err, "reading request body")
 	}
 
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return errors.Wrap(err, "decompressing snappy")
 	}
 
 	var writeRequest prompb.WriteRequest
 	if err := proto.Unmarshal(reqBuf, &writeRequest); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return errors.Wrap(err, "decoding write request")
 	}
 
 	maxTS := int64(math.MinInt64)
@@ -277,39 +324,25 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
 	if !p.IsActive() {
 		// Mark samples that are within penalty of the highest timestamp to be
 		// considered succesfully sent.
 		if maxTS < p.HighestSentTimestamp()+p.penalty {
 			w.WriteHeader(http.StatusAccepted)
-			return
+			return nil
 		}
 		// A 5XX error will tell Prometheus to retry.
 		http.Error(w, "active replica has not sent these yet", http.StatusServiceUnavailable)
-		return
+		// This does not count as a failure since it is working as designed.
+		return nil
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), bytes.NewBuffer(compressed))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	proxyReq.Header = r.Header
+	statusCode, err := p.handleUpstream(w, r, bytes.NewBuffer(compressed))
 
-	resp, err := p.client.Do(proxyReq)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	io.Copy(w, resp.Body)
-	resp.Body.Close()
-	w.WriteHeader(resp.StatusCode)
-
-	// TODO: Do the following in error cases too.
 	p.mux.Lock()
 	update := false
-	if resp.StatusCode < 500 && maxTS > p.state.HighestSentTimestamp {
+	if statusCode < 500 && maxTS > p.state.HighestSentTimestamp {
 		p.state.HighestSentTimestamp = maxTS
 		update = true
 	}
@@ -322,6 +355,27 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.broadcasts.QueueBroadcast(p.state)
 	}
 	p.mux.Unlock()
+	return nil
+}
+
+func (p *proxy) handleUpstream(w http.ResponseWriter, r *http.Request, data io.Reader) (int, error) {
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return 0, errors.Wrap(err, "creating proxy request")
+	}
+	proxyReq.Header = r.Header
+
+	resp, err := p.client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return 0, errors.Wrap(err, "doing upstream request")
+	}
+
+	io.Copy(w, resp.Body)
+	resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+	return resp.StatusCode, nil
 }
 
 func (p *proxy) resolveMembers(ctx context.Context, members []string) ([]string, error) {
