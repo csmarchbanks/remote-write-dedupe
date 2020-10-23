@@ -23,13 +23,29 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/prometheus/prompb"
 )
 
 const namespace = "rwdedupe"
 
 var (
-	requests = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	inFlightGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "proxy",
+		Name:      "in_flight_requests",
+		Help:      "How many requests are actively being processed.",
+	}, []string{"url"})
+	requests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "proxy",
+			Name:      "requests_total",
+			Help:      "A counter for requests to the wrapped handler.",
+		},
+		[]string{"url", "code"},
+	)
+	requestsTiming = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Subsystem: "proxy",
 		Name:      "request_duration_seconds",
@@ -276,12 +292,30 @@ func (p *proxy) MergeRemoteState(buf []byte, join bool) {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	inFlightGauge := inFlightGauge.With(prometheus.Labels{"url": r.URL.String()})
+	handlerDuration := requestsTiming.MustCurryWith(prometheus.Labels{"url": r.URL.String()})
+	handlerCounter := requests.MustCurryWith(prometheus.Labels{"url": r.URL.String()})
+
+	promhttp.InstrumentHandlerInFlight(inFlightGauge,
+		promhttp.InstrumentHandlerDuration(handlerDuration,
+			promhttp.InstrumentHandlerCounter(handlerCounter,
+				http.HandlerFunc(p.handleProxy),
+			),
+		),
+	).ServeHTTP(w, r)
+}
+
+func (p *proxy) HandleReady(w http.ResponseWriter, r *http.Request) {
 	if !p.Ready() {
 		http.Error(w, "proxy not ready", http.StatusServiceUnavailable)
 		return
 	}
+	w.Write([]byte("proxy is ready"))
+}
 
-	if r.URL.Path == "/ready" {
+func (p *proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if !p.Ready() {
+		http.Error(w, "proxy not ready", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -290,14 +324,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		level.Warn(p.logger).Log("msg", "error proxying to upstream", "url", r.URL.String(), "err", err)
 		failures.WithLabelValues(r.URL.String()).Inc()
 	}
-
 }
 
 func (p *proxy) handleWriteRequest(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
-	defer func() {
-		requests.WithLabelValues(r.URL.String()).Observe(time.Since(start).Seconds())
-	}()
 	compressed, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

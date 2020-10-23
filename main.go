@@ -77,6 +77,7 @@ func main() {
 	}()
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/ready", http.HandlerFunc(p.HandleReady))
 	mux.Handle("/", p)
 	http.ListenAndServe(*listenAddr, mux)
 }
